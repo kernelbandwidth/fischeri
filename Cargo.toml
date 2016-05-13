@@ -1,0 +1,9 @@
+[package]
+name = "fischeri"
+version = "0.1.0"
+authors = ["emptylist <crooks1379@gmail.com>"]
+
+[dependencies]
+iron = "*"
+rustc-serialize = "*"
+
