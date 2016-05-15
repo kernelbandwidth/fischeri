@@ -1,15 +1,25 @@
 extern crate rustc_serialize;
 extern crate iron;
+extern crate bincode;
 
 use iron::prelude::*;
 use iron::status;
+
 use rustc_serialize::{json, Encodable, Encoder, Decoder};
-use std::process::Command;
+
+use bincode::SizeLimit;
+use bincode::rustc_serialize::{encode, decode};
+
+use std::env;
+use std::str;
+use std::io::{BufWriter, BufReader, Read};
+use std::process::{Command, exit};
 use std::collections::HashMap;
 use std::net::{SocketAddrV4, Ipv4Addr};
-use std::str;
-use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 
 #[derive(PartialEq, Eq, Clone, Debug, RustcEncodable, RustcDecodable)]
 struct Comment {
@@ -18,15 +28,49 @@ struct Comment {
     body: String
 }
 
-#[derive(PartialEq, Eq, Debug, RustcDecodable)]
+#[derive(PartialEq, Eq, Clone, Debug, RustcDecodable, RustcEncodable)]
 struct PostComment {
     page: String,
     comment: Comment
 }
 
+struct Storage {
+    recv: mpsc::Receiver<PostComment>,
+    storage_location: File
+}
+
+impl Storage {
+    fn new(rx: mpsc::Receiver<PostComment>, path: &Path) -> Storage {
+      let fp = path.join("comments.fdp");
+      let f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(fp);
+
+      Storage{ recv: rx, storage_location: f.unwrap() }
+    }
+
+    fn save(&mut self, pcomment: PostComment) {
+      let mut writer = BufWriter::new(&self.storage_location);
+      bincode::rustc_serialize::encode_into(&pcomment, &mut writer, bincode::SizeLimit::Infinite).unwrap();
+    }
+
+    fn load(&self) -> Vec<PostComment> {
+      let mut reader = BufReader::new(&self.storage_location);
+      let mut data: Vec<PostComment> = Vec::new();
+      while let Ok(decoded) = bincode::rustc_serialize::decode_from(&mut reader,
+                                                                    bincode::SizeLimit::Infinite) {
+        data.push(decoded)
+      }
+      data
+    }
+}
+
 #[derive(Debug)]
 struct CommentSystem {
-    threads: Box<HashMap<String, Vec<Comment>>>
+    threads: Box<HashMap<String, Vec<Comment>>>,
+    storage_send: mpsc::Sender<PostComment>
 }
 
 impl CommentSystem {
@@ -36,14 +80,9 @@ impl CommentSystem {
             let new_comment = json::decode::<PostComment>(&content);
             match new_comment {
                 Ok(post_comment) => {
-                    let posted = if let Some(thread) = self.threads.get_mut(&post_comment.page) {
-                        thread.push(post_comment.comment.clone());
-                        true
-                    } else { false };
-                    if !posted {
-                        self.threads.insert(post_comment.page, vec!(post_comment.comment));
-                    }
-                    Ok(Response::with((status::Ok, "Comment accepted!\n")))
+                  self.insert_comment(&post_comment);
+                  self.storage_send.send(post_comment);
+                  Ok(Response::with((status::Ok, "Comment accepted!\n")))
                 },
                 Err(_) => Ok(Response::with((status::BadRequest, "Bad format.\n")))
             }
@@ -67,10 +106,27 @@ impl CommentSystem {
           Ok(Response::with((status::BadRequest, "No page specified.\n")))
       }
     }
+
+    fn insert_comment(&mut self, comment: &PostComment) {
+      let inserted = if let Some(thread) = self.threads.get_mut(&comment.page) {
+        thread.push(comment.comment.clone());
+        true
+      } else { false };
+      if !inserted {
+        let inserting = comment.clone();
+        self.threads.insert(inserting.page, vec!(inserting.comment));
+      }
+    }
+
+    fn insert_comments(&mut self, comments: Vec<PostComment>) {
+      for pcmt in comments.iter() {
+        self.insert_comment(pcmt);
+      }
+    }
 }
 
 struct Server {
-    comment_system: Arc<Mutex<CommentSystem>>
+  comment_system: Arc<Mutex<CommentSystem>>
 }
 
 impl iron::Handler for Server {
@@ -86,7 +142,39 @@ impl iron::Handler for Server {
 }
     
 fn main() {
-    let comment_system: CommentSystem = CommentSystem{threads: Box::new(HashMap::new()) };
+    let (tx, rx) = mpsc::channel();
+    let mut comment_system: CommentSystem = CommentSystem {
+      threads: Box::new(HashMap::new()),
+      storage_send: tx
+    };
+
+    let backup_path_name = if let Ok(path_name) = env::var("FISCHERI_PATH") {
+      println!("Saving backup data in directory {}", path_name);
+      path_name
+    } else {
+      println!("Please set FISCHERI_PATH to a valid directory path for storing back-up data");
+      exit(0);
+    };
+
+    let storage_path = Path::new(&backup_path_name);
+
+    if !storage_path.exists() {
+      println!("Please set FISCHERI_PATH to a valid directory path for storing back-up data");
+      exit(0);
+    };
+
+    let mut storage = Storage::new(rx, storage_path);
+
+    let comments_on_disk = storage.load();
+
+    comment_system.insert_comments(comments_on_disk);
+
+    thread::spawn(move || {
+      while let Ok(data) = storage.recv.recv() {
+        println!("{:?}", data);
+        storage.save(data);
+      }
+    });
 
     let host_port = 8080;
     let hostname_cmd = 
