@@ -96,8 +96,11 @@ impl CommentSystem {
         Some(ref page_request) => {
           println!("{}", page_request);
           match self.threads.get(page_request) {
-            Some(thread) =>
-              Ok(Response::with((status::Ok, json::encode(thread).unwrap() + "\n"))),
+            Some(thread) => {
+              let mut res = Response::with((status::Ok, json::encode(thread).unwrap() + "\n"));
+              res.headers.set(iron::headers::AccessControlAllowOrigin::Value("http://localhost:5555".to_owned()));
+              Ok(res)
+            },
             None =>
               Ok(Response::with((status::NotFound, "Page name not found\n")))
           }
@@ -206,6 +209,7 @@ fn main() {
     };
  
     let server = Server{comment_system: Arc::new(Mutex::new(comment_system))};
+    println!("Running from {}", file!());
     println!("Server listening on {}", host_addr);
     Iron::new(server).http(host_addr).unwrap();
 }
